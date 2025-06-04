@@ -1,0 +1,19 @@
+{
+  "name": "worker_geokurs_base_stations",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "start": "node src/worker.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "dependencies": {
+    "bull": "^4.16.5",
+    "express": "^5.1.0",
+    "ssh2": "^1.16.0",
+    "ssh2-sftp-client": "^12.0.0"
+  }
+}
