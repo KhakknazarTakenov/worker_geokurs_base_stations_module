@@ -6,6 +6,10 @@ import { logMessage } from './logger.js';
 import path from 'path';
 import express from 'express';
 import './global.js'
+import * as dotenv from 'dotenv';
+
+const envPath = path.join(process.cwd(), '.env');
+dotenv.config({ path: envPath });
 
 // Настраиваем HTTP-сервер для мониторинга
 const app = express();
