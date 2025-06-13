@@ -2,13 +2,48 @@
 import Client from 'ssh2-sftp-client';
 import { Client as SSHClient } from 'ssh2';
 import Queue from 'bull';
-import { logMessage, formatDate } from './logger.js';
+import { logMessage, formatDate } from './logger.js'; // Добавлен импорт formatDate
 import path from 'path';
 import express from 'express';
 import * as dotenv from 'dotenv';
 import fs from 'fs/promises';
 
-// ... (код до функции saveTempFile без изменений)
+const envPath = path.join(process.cwd(), '.env');
+dotenv.config({ path: envPath });
+
+// Настраиваем HTTP-сервер для мониторинга
+const app = express();
+app.get('/health', async (req, res) => {
+    try {
+        const queueStats = await Promise.all([
+            fileOperationsQueue.getWaitingCount(),
+            fileOperationsQueue.getActiveCount(),
+            fileOperationsQueue.getCompletedCount(),
+            fileOperationsQueue.getFailedCount()
+        ]).then(([waiting, active, completed, failed]) => ({
+            waiting, active, completed, failed
+        }));
+
+        res.json({
+            status: 'healthy',
+            queues: { fileOperations: queueStats }
+        });
+    } catch (error) {
+        await logMessage(LOG_TYPES.E, 'worker', `Health check failed: ${error.message}`);
+        res.status(500).json({ status: 'error', error: error.message });
+    }
+});
+app.listen(5473, () => console.log('Worker HTTP server running on port 5473'));
+
+// Конфигурация Redis
+const redisConfig = {
+    host: process.env.REDIS_HOST || '127.0.0.1',
+    port: parseInt(process.env.REDIS_PORT) || 6379,
+    password: process.env.REDIS_PASSWORD || ''
+};
+
+// Настраиваем единую очередь для операций с файлами
+const fileOperationsQueue = new Queue('fileOperationsQueue', { redis: redisConfig });
 
 // saveTempFile - Сохраняет временный файл в воркере
 async function saveTempFile(content, filename) {
