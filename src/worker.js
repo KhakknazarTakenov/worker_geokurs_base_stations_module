@@ -2,12 +2,12 @@
 import Client from 'ssh2-sftp-client';
 import { Client as SSHClient } from 'ssh2';
 import Queue from 'bull';
-import { logMessage, formatDate } from './logger.js';
+import { logMessage, formatDate, formatTime } from './logger.js'; // Добавлен импорт formatTime
 import path from 'path';
 import express from 'express';
 import * as dotenv from 'dotenv';
 import fs from 'fs/promises';
-import './global.js'
+import './global.js';
 
 const envPath = path.join(process.cwd(), '.env');
 dotenv.config({ path: envPath });
@@ -81,8 +81,10 @@ async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
     await logMessage(LOG_TYPES.I, 'backup', `Starting backup for ${remotePath}`);
     try {
         const date = new Date();
-        const folderName = `folder_${formatDate(date)}`;
-        const backupDir = `/home/casteradmin/${folderName}`;
+        const dateFolder = `folder_${formatDate(date)}`;
+        const timeFolder = `folder_${formatDate(date)}_${formatTime(date)}`;
+        const dateDir = `/home/casteradmin/${dateFolder}`;
+        const backupDir = `${dateDir}/${timeFolder}`;
         const backupPath = `${backupDir}/${filename}`;
         const backupRoot = '/home/casteradmin';
 
@@ -95,17 +97,27 @@ async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
             return;
         }
 
-        // Создаем папку для бэкапа
+        // Создаем дневную папку
+        await logMessage(LOG_TYPES.I, 'backup', `Creating date directory ${dateDir}`);
+        try {
+            await sftp.mkdir(dateDir, true);
+            await logMessage(LOG_TYPES.I, 'backup', `Created date directory ${dateDir}`);
+        } catch (error) {
+            if (error.code !== 4) { // Код 4 - папка уже существует
+                await logMessage(LOG_TYPES.E, 'backup', `Failed to create date directory ${dateDir}: ${error.message}`);
+                return;
+            }
+            await logMessage(LOG_TYPES.I, 'backup', `Date directory ${dateDir} already exists`);
+        }
+
+        // Создаем временную папку
         await logMessage(LOG_TYPES.I, 'backup', `Creating backup directory ${backupDir}`);
         try {
             await sftp.mkdir(backupDir, true);
             await logMessage(LOG_TYPES.I, 'backup', `Created backup directory ${backupDir}`);
         } catch (error) {
-            if (error.code !== 4) { // Код 4 - папка уже существует
-                await logMessage(LOG_TYPES.E, 'backup', `Failed to create backup directory ${backupDir}: ${error.message}`);
-                return;
-            }
-            await logMessage(LOG_TYPES.I, 'backup', `Backup directory ${backupDir} already exists`);
+            await logMessage(LOG_TYPES.E, 'backup', `Failed to create backup directory ${backupDir}: ${error.message}`);
+            return;
         }
 
         // Копируем текущий файл в папку бэкапа
@@ -137,36 +149,66 @@ async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
             return;
         }
 
-        // Получаем список папок бэкапов
-        await logMessage(LOG_TYPES.I, 'backup', `Starting rotation check in ${backupRoot}`);
-        let dirList;
+        // Ротация временных папок в дневной папке
+        await logMessage(LOG_TYPES.I, 'backup', `Starting time folder rotation check in ${dateDir}`);
+        let timeDirList;
         try {
-            dirList = await sftp.list(backupRoot);
-            await logMessage(LOG_TYPES.I, 'backup', `Listed directories in ${backupRoot}`);
+            timeDirList = await sftp.list(dateDir);
+            await logMessage(LOG_TYPES.I, 'backup', `Listed time directories in ${dateDir}`);
         } catch (error) {
-            await logMessage(LOG_TYPES.E, 'backup', `Failed to list directories in ${backupRoot}: ${error.message}`);
+            await logMessage(LOG_TYPES.E, 'backup', `Failed to list time directories in ${dateDir}: ${error.message}`);
             return;
         }
 
-        const backupFolders = dirList
+        const timeFolders = timeDirList
+            .filter(item => item.type === 'd' && item.name.match(/^folder_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}$/))
+            .sort((a, b) => a.name.localeCompare(b.name)); // Сортировка по имени (дата и время)
+
+        await logMessage(LOG_TYPES.I, 'backup', `Found ${timeFolders.length} time folders in ${dateDir}: ${timeFolders.map(f => f.name).join(', ')}`);
+
+        if (timeFolders.length >= 10) {
+            const oldestTimeFolder = timeFolders[0].name;
+            const oldestTimePath = `${dateDir}/${oldestTimeFolder}`;
+            await logMessage(LOG_TYPES.I, 'backup', `Deleting oldest time folder ${oldestTimePath}`);
+            try {
+                await sftp.rmdir(oldestTimePath, true);
+                await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest time folder ${oldestTimePath}`);
+            } catch (error) {
+                await logMessage(LOG_TYPES.E, 'backup', `Failed to delete ${oldestTimePath}: ${error.message}`);
+            }
+        } else {
+            await logMessage(LOG_TYPES.I, 'backup', `No time folder rotation needed, ${timeFolders.length} folders found in ${dateDir}`);
+        }
+
+        // Ротация дневных папок
+        await logMessage(LOG_TYPES.I, 'backup', `Starting date folder rotation check in ${backupRoot}`);
+        let dateDirList;
+        try {
+            dateDirList = await sftp.list(backupRoot);
+            await logMessage(LOG_TYPES.I, 'backup', `Listed date directories in ${backupRoot}`);
+        } catch (error) {
+            await logMessage(LOG_TYPES.E, 'backup', `Failed to list date directories in ${backupRoot}: ${error.message}`);
+            return;
+        }
+
+        const dateFolders = dateDirList
             .filter(item => item.type === 'd' && item.name.match(/^folder_\d{4}-\d{2}-\d{2}$/))
             .sort((a, b) => a.name.localeCompare(b.name)); // Сортировка по имени (дата)
 
-        await logMessage(LOG_TYPES.I, 'backup', `Found ${backupFolders.length} backup folders: ${backupFolders.map(f => f.name).join(', ')}`);
+        await logMessage(LOG_TYPES.I, 'backup', `Found ${dateFolders.length} date folders: ${dateFolders.map(f => f.name).join(', ')}`);
 
-        // Если папок >= 10, удаляем самую старую
-        if (backupFolders.length >= 10) {
-            const oldestFolder = backupFolders[0].name;
-            const oldestPath = `${backupRoot}/${oldestFolder}`;
-            await logMessage(LOG_TYPES.I, 'backup', `Deleting oldest backup folder ${oldestPath}`);
+        if (dateFolders.length >= 10) {
+            const oldestDateFolder = dateFolders[0].name;
+            const oldestDatePath = `${backupRoot}/${oldestDateFolder}`;
+            await logMessage(LOG_TYPES.I, 'backup', `Deleting oldest date folder ${oldestDatePath}`);
             try {
-                await sftp.rmdir(oldestPath, true);
-                await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest backup folder ${oldestPath}`);
+                await sftp.rmdir(oldestDatePath, true);
+                await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest date folder ${oldestDatePath}`);
             } catch (error) {
-                await logMessage(LOG_TYPES.E, 'backup', `Failed to delete ${oldestPath}: ${error.message}`);
+                await logMessage(LOG_TYPES.E, 'backup', `Failed to delete ${oldestDatePath}: ${error.message}`);
             }
         } else {
-            await logMessage(LOG_TYPES.I, 'backup', `No rotation needed, ${backupFolders.length} folders found`);
+            await logMessage(LOG_TYPES.I, 'backup', `No date folder rotation needed, ${dateFolders.length} folders found`);
         }
     } catch (error) {
         await logMessage(LOG_TYPES.E, 'backup', `Unexpected error in backup for ${remotePath}: ${error.message}`);
@@ -263,7 +305,6 @@ async function processFileOperation(job) {
                         for (let format of station.formats) {
                             if (!format || typeof format !== 'string') {
                                 await logMessage(LOG_TYPES.E, 'activate', `Invalid format in station ${stationCode}: ${format}`);
-                                continue;
                             }
                             const mountPoint = (format.startsWith('/') ? format : '/' + format).replace(/:?$/, '');
                             const existing = formatsList.find(l => l.startsWith(mountPoint + ':'));
@@ -633,7 +674,7 @@ async function processFileOperation(job) {
         }
     } catch (error) {
         await logMessage(LOG_TYPES.E, 'worker', `Failed to process job ${job.id} for ${remotePath}: ${error.message}`);
-        throw error; // Пробрасываем ошибку, чтобы очередь отметила задачу как неуспешную
+        throw error;
     } finally {
         // Удаляем локальный временный файл
         if (tempLocalPath) {
