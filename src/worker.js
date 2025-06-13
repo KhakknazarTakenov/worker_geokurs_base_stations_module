@@ -77,12 +77,11 @@ async function downloadFile(remotePath, sftpConfig) {
 }
 
 // backupAndRotate - Создает бэкап файла и управляет ротацией папок
-async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
+async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename, taskDate) {
     await logMessage(LOG_TYPES.I, 'backup', `Starting backup for ${remotePath}`);
     try {
-        const date = new Date();
-        const dateFolder = `folder_${formatDate(date)}`;
-        const timeFolder = `folder_${formatDate(date)}_${formatTime(date)}`;
+        const dateFolder = `folder_${formatDate(taskDate)}`;
+        const timeFolder = `folder_${formatDate(taskDate)}_${formatTime(taskDate)}`;
         const dateDir = `/home/casteradmin/${dateFolder}`;
         const backupDir = `${dateDir}/${timeFolder}`;
         const backupPath = `${backupDir}/${filename}`;
@@ -221,6 +220,7 @@ async function processFileOperation(job) {
     const { operation, params, remotePath, sftpConfig } = job.data;
     const filename = path.basename(remotePath);
     let tempLocalPath;
+    const taskDate = new Date(); // Фиксируем время начала задачи
 
     try {
         // Скачиваем текущий файл
@@ -265,7 +265,7 @@ async function processFileOperation(job) {
                         }
                     }
                     if (!foundGroupsStart) throw new Error('gAdmins group not found in groups.aut');
-                    groupsLines = [...headerGroupsLines, ...groupsLines.slice(headerGroupsLines.length).filter(line => !line.startsWith(`${finalGroup}:`)), `${finalGroup}:${finalLogin}:1`];
+                    groupsLines = [...headerUsersLines, ...groupsLines.slice(headerGroupsLines.length).filter(line => !line.startsWith(`${finalGroup}:`)), `${finalGroup}:${finalLogin}:1`];
                     modifiedContent = groupsLines.join('\n') + '\n';
                 }
 
@@ -630,7 +630,7 @@ async function processFileOperation(job) {
             });
 
             // Создаем бэкап и управляем ротацией
-            await backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename);
+            await backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename, taskDate);
 
             // Выполняем sudo cp
             await logMessage(LOG_TYPES.I, 'worker', `Copying to ${remotePath}`);
