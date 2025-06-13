@@ -220,7 +220,8 @@ async function processFileOperation(job) {
     const { operation, params, remotePath, sftpConfig } = job.data;
     const filename = path.basename(remotePath);
     let tempLocalPath;
-    const taskDate = new Date(); // Фиксируем время начала задачи
+    // Используем taskTimestamp из params, если доступно, иначе текущее время
+    const taskDate = params.taskTimestamp ? new Date(params.taskTimestamp) : new Date();
 
     try {
         // Скачиваем текущий файл
@@ -265,7 +266,7 @@ async function processFileOperation(job) {
                         }
                     }
                     if (!foundGroupsStart) throw new Error('gAdmins group not found in groups.aut');
-                    groupsLines = [...headerUsersLines, ...groupsLines.slice(headerGroupsLines.length).filter(line => !line.startsWith(`${finalGroup}:`)), `${finalGroup}:${finalLogin}:1`];
+                    groupsLines = [...headerGroupsLines, ...groupsLines.slice(headerGroupsLines.length).filter(line => !line.startsWith(`${finalGroup}:`)), `${finalGroup}:${finalLogin}:1`];
                     modifiedContent = groupsLines.join('\n') + '\n';
                 }
 
@@ -305,6 +306,7 @@ async function processFileOperation(job) {
                         for (let format of station.formats) {
                             if (!format || typeof format !== 'string') {
                                 await logMessage(LOG_TYPES.E, 'activate', `Invalid format in station ${stationCode}: ${format}`);
+                                continue;
                             }
                             const mountPoint = (format.startsWith('/') ? format : '/' + format).replace(/:?$/, '');
                             const existing = formatsList.find(l => l.startsWith(mountPoint + ':'));
