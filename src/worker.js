@@ -2,11 +2,12 @@
 import Client from 'ssh2-sftp-client';
 import { Client as SSHClient } from 'ssh2';
 import Queue from 'bull';
-import { logMessage, formatDate } from './logger.js'; // Добавлен импорт formatDate
+import { logMessage, formatDate } from './logger.js';
 import path from 'path';
 import express from 'express';
 import * as dotenv from 'dotenv';
 import fs from 'fs/promises';
+import './global.js'
 
 const envPath = path.join(process.cwd(), '.env');
 dotenv.config({ path: envPath });
@@ -77,57 +78,100 @@ async function downloadFile(remotePath, sftpConfig) {
 
 // backupAndRotate - Создает бэкап файла и управляет ротацией папок
 async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
+    await logMessage(LOG_TYPES.I, 'backup', `Starting backup for ${remotePath}`);
     try {
         const date = new Date();
         const folderName = `folder_${formatDate(date)}`;
         const backupDir = `/home/casteradmin/${folderName}`;
         const backupPath = `${backupDir}/${filename}`;
+        const backupRoot = '/home/casteradmin';
+
+        // Проверяем доступность /home/casteradmin
+        await logMessage(LOG_TYPES.I, 'backup', `Checking access to ${backupRoot}`);
+        try {
+            await sftp.stat(backupRoot);
+        } catch (error) {
+            await logMessage(LOG_TYPES.E, 'backup', `Cannot access ${backupRoot}: ${error.message}`);
+            return;
+        }
 
         // Создаем папку для бэкапа
+        await logMessage(LOG_TYPES.I, 'backup', `Creating backup directory ${backupDir}`);
         try {
             await sftp.mkdir(backupDir, true);
             await logMessage(LOG_TYPES.I, 'backup', `Created backup directory ${backupDir}`);
         } catch (error) {
             if (error.code !== 4) { // Код 4 - папка уже существует
-                throw new Error(`Failed to create backup directory ${backupDir}: ${error.message}`);
+                await logMessage(LOG_TYPES.E, 'backup', `Failed to create backup directory ${backupDir}: ${error.message}`);
+                return;
             }
+            await logMessage(LOG_TYPES.I, 'backup', `Backup directory ${backupDir} already exists`);
         }
 
         // Копируем текущий файл в папку бэкапа
-        await new Promise((resolve, reject) => {
-            ssh.exec(`sudo cp ${remotePath} ${backupPath}`, { pty: true }, (err, stream) => {
-                if (err) reject(err);
+        await logMessage(LOG_TYPES.I, 'backup', `Copying ${remotePath} to ${backupPath}`);
+        try {
+            await new Promise((resolve, reject) => {
                 let stderr = '';
-                stream.on('close', (code) => {
-                    if (code === 0) resolve();
-                    else reject(new Error(`sudo cp to backup failed: ${stderr}`));
-                }).on('data', (data) => {
-                    if (data.toString().includes('password')) {
-                        stream.write(`${sftpConfig.sudoPassword}\n`);
+                ssh.exec(`sudo cp ${remotePath} ${backupPath}`, { pty: true }, (err, stream) => {
+                    if (err) {
+                        reject(err);
+                        return;
                     }
-                }).stderr.on('data', (data) => stderr += data);
+                    stream.on('close', (code) => {
+                        if (code === 0) resolve();
+                        else reject(new Error(`sudo cp to backup failed with code ${code}: ${stderr}`));
+                    }).on('data', (data) => {
+                        const dataStr = data.toString();
+                        if (dataStr.includes('password')) {
+                            stream.write(`${sftpConfig.sudoPassword}\n`);
+                        }
+                    }).stderr.on('data', (data) => {
+                        stderr += data;
+                    });
+                });
             });
-        });
-        await logMessage(LOG_TYPES.I, 'backup', `Backed up ${remotePath} to ${backupPath}`);
+            await logMessage(LOG_TYPES.I, 'backup', `Backed up ${remotePath} to ${backupPath}`);
+        } catch (error) {
+            await logMessage(LOG_TYPES.E, 'backup', `Failed to copy ${remotePath} to ${backupPath}: ${error.message}`);
+            return;
+        }
 
         // Получаем список папок бэкапов
-        const backupRoot = '/home/casteradmin';
-        const dirList = await sftp.list(backupRoot);
+        await logMessage(LOG_TYPES.I, 'backup', `Starting rotation check in ${backupRoot}`);
+        let dirList;
+        try {
+            dirList = await sftp.list(backupRoot);
+            await logMessage(LOG_TYPES.I, 'backup', `Listed directories in ${backupRoot}`);
+        } catch (error) {
+            await logMessage(LOG_TYPES.E, 'backup', `Failed to list directories in ${backupRoot}: ${error.message}`);
+            return;
+        }
+
         const backupFolders = dirList
             .filter(item => item.type === 'd' && item.name.match(/^folder_\d{4}-\d{2}-\d{2}$/))
             .sort((a, b) => a.name.localeCompare(b.name)); // Сортировка по имени (дата)
+
+        await logMessage(LOG_TYPES.I, 'backup', `Found ${backupFolders.length} backup folders: ${backupFolders.map(f => f.name).join(', ')}`);
 
         // Если папок >= 10, удаляем самую старую
         if (backupFolders.length >= 10) {
             const oldestFolder = backupFolders[0].name;
             const oldestPath = `${backupRoot}/${oldestFolder}`;
-            await sftp.rmdir(oldestPath, true);
-            await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest backup folder ${oldestPath}`);
+            await logMessage(LOG_TYPES.I, 'backup', `Deleting oldest backup folder ${oldestPath}`);
+            try {
+                await sftp.rmdir(oldestPath, true);
+                await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest backup folder ${oldestPath}`);
+            } catch (error) {
+                await logMessage(LOG_TYPES.E, 'backup', `Failed to delete ${oldestPath}: ${error.message}`);
+            }
+        } else {
+            await logMessage(LOG_TYPES.I, 'backup', `No rotation needed, ${backupFolders.length} folders found`);
         }
     } catch (error) {
-        await logMessage(LOG_TYPES.E, 'backup', `Backup or rotation failed for ${remotePath}: ${error.message}`);
-        // Не прерываем основной процесс, только логируем
+        await logMessage(LOG_TYPES.E, 'backup', `Unexpected error in backup for ${remotePath}: ${error.message}`);
     }
+    await logMessage(LOG_TYPES.I, 'backup', `Finished backup for ${remotePath}`);
 }
 
 // processFileOperation - Обрабатывает задачу с файлом (скачивание, модификация, запись)
@@ -522,6 +566,7 @@ async function processFileOperation(job) {
             });
 
             // Загружаем файл в /tmp на удаленном сервере
+            await logMessage(LOG_TYPES.I, 'worker', `Uploading to ${tempRemotePath}, job ID: ${job.id}`);
             await sftp.put(tempLocalPath, tempRemotePath);
             await logMessage(LOG_TYPES.I, 'worker', `Uploaded to ${tempRemotePath}, job ID: ${job.id}`);
 
@@ -547,6 +592,7 @@ async function processFileOperation(job) {
             await backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename);
 
             // Выполняем sudo cp
+            await logMessage(LOG_TYPES.I, 'worker', `Copying to ${remotePath}`);
             const command = `sudo cp ${tempRemotePath} ${remotePath}`;
             let stderr = '';
             await new Promise((resolve, reject) => {
@@ -565,7 +611,7 @@ async function processFileOperation(job) {
             await logMessage(LOG_TYPES.I, 'worker', `Copied to ${remotePath}`);
 
             // Проверяем содержимое записанного файла
-            await sftp.connect(sftpConfig);
+            await logMessage(LOG_TYPES.I, 'worker', `Verifying copied file size at ${remotePath}`);
             const remoteStats = await sftp.stat(remotePath);
             if (remoteStats.size !== Buffer.from(modifiedContent).length) {
                 throw new Error(`Incomplete file copy: ${remotePath} size ${remoteStats.size}, expected ${Buffer.from(modifiedContent).length}`);
@@ -587,7 +633,7 @@ async function processFileOperation(job) {
         }
     } catch (error) {
         await logMessage(LOG_TYPES.E, 'worker', `Failed to process job ${job.id} for ${remotePath}: ${error.message}`);
-        return { error: error.message };
+        throw error; // Пробрасываем ошибку, чтобы очередь отметила задачу как неуспешную
     } finally {
         // Удаляем локальный временный файл
         if (tempLocalPath) {
