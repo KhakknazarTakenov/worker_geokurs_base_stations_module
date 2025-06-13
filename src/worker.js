@@ -2,12 +2,12 @@
 import Client from 'ssh2-sftp-client';
 import { Client as SSHClient } from 'ssh2';
 import Queue from 'bull';
-import { logMessage, formatDate, formatTime } from './logger.js'; // Добавлен импорт formatTime
+import { logMessage, formatDate, formatTime } from './logger.js';
 import path from 'path';
 import express from 'express';
 import * as dotenv from 'dotenv';
 import fs from 'fs/promises';
-import './global.js';
+import './global.js'
 
 const envPath = path.join(process.cwd(), '.env');
 dotenv.config({ path: envPath });
@@ -161,12 +161,12 @@ async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
         }
 
         const timeFolders = timeDirList
-            .filter(item => item.type === 'd' && item.name.match(/^folder_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}$/))
+            .filter(item => item.type === 'd' && item.name.match(/^folder_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}$/))
             .sort((a, b) => a.name.localeCompare(b.name)); // Сортировка по имени (дата и время)
 
         await logMessage(LOG_TYPES.I, 'backup', `Found ${timeFolders.length} time folders in ${dateDir}: ${timeFolders.map(f => f.name).join(', ')}`);
 
-        if (timeFolders.length >= 10) {
+        if (timeFolders.length >= 30) {
             const oldestTimeFolder = timeFolders[0].name;
             const oldestTimePath = `${dateDir}/${oldestTimeFolder}`;
             await logMessage(LOG_TYPES.I, 'backup', `Deleting oldest time folder ${oldestTimePath}`);
