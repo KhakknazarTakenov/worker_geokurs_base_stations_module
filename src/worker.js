@@ -2,7 +2,7 @@
 import Client from 'ssh2-sftp-client';
 import { Client as SSHClient } from 'ssh2';
 import Queue from 'bull';
-import { logMessage } from './logger.js';
+import { logMessage, formatDate } from './logger.js';
 import path from 'path';
 import express from 'express';
 import * as dotenv from 'dotenv';
@@ -33,7 +33,7 @@ async function downloadFile(remotePath, sftpConfig) {
         const content = await sftp.get(remotePath);
         return content.toString().split('\n').filter(line => line.trim()).join('\n');
     } catch (error) {
-        await logMessage('ERROR', 'downloadFile', `Failed to download ${remotePath}: ${error.message}`);
+        await logMessage(LOG_TYPES.E, 'downloadFile', `Failed to download ${remotePath}: ${error.message}`);
         throw error;
     } finally {
         await sftp.end();
@@ -51,7 +51,7 @@ async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
         // Создаем папку для бэкапа
         try {
             await sftp.mkdir(backupDir, true);
-            await logMessage('INFO', 'backup', `Created backup directory ${backupDir}`);
+            await logMessage(LOG_TYPES.I, 'backup', `Created backup directory ${backupDir}`);
         } catch (error) {
             if (error.code !== 4) { // Код 4 - папка уже существует
                 throw new Error(`Failed to create backup directory ${backupDir}: ${error.message}`);
@@ -73,7 +73,7 @@ async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
                 }).stderr.on('data', (data) => stderr += data);
             });
         });
-        await logMessage('INFO', 'backup', `Backed up ${remotePath} to ${backupPath}`);
+        await logMessage(LOG_TYPES.I, 'backup', `Backed up ${remotePath} to ${backupPath}`);
 
         // Получаем список папок бэкапов
         const backupRoot = '/home/casteradmin';
@@ -87,10 +87,10 @@ async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename) {
             const oldestFolder = backupFolders[0].name;
             const oldestPath = `${backupRoot}/${oldestFolder}`;
             await sftp.rmdir(oldestPath, true);
-            await logMessage('INFO', 'backup', `Deleted oldest backup folder ${oldestPath}`);
+            await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest backup folder ${oldestPath}`);
         }
     } catch (error) {
-        await logMessage('ERROR', 'backup', `Backup or rotation failed for ${remotePath}: ${error.message}`);
+        await logMessage(LOG_TYPES.E, 'backup', `Backup or rotation failed for ${remotePath}: ${error.message}`);
         // Не прерываем основной процесс, только логируем
     }
 }
@@ -172,18 +172,18 @@ async function processFileOperation(job) {
 
                     for (const station of stations) {
                         if (!station.name || !station.formats || !Array.isArray(station.formats)) {
-                            await logMessage('ERROR', 'activate', `Invalid station data: ${JSON.stringify(station)}`);
+                            await logMessage(LOG_TYPES.E, 'activate', `Invalid station data: ${JSON.stringify(station)}`);
                             continue;
                         }
                         const stationCode = `#${station.name.trim()}`;
                         if (!stationsMap.has(stationCode)) {
                             stationsMap.set(stationCode, []);
-                            await logMessage('INFO', 'activate', `Added new station: ${stationCode}`);
+                            await logMessage(LOG_TYPES.I, 'activate', `Added new station: ${stationCode}`);
                         }
                         const formatsList = stationsMap.get(stationCode);
                         for (let format of station.formats) {
                             if (!format || typeof format !== 'string') {
-                                await logMessage('ERROR', 'activate', `Invalid format in station ${stationCode}: ${format}`);
+                                await logMessage(LOG_TYPES.E, 'activate', `Invalid format in station ${stationCode}: ${format}`);
                                 continue;
                             }
                             const mountPoint = (format.startsWith('/') ? format : '/' + format).replace(/:?$/, '');
@@ -199,7 +199,7 @@ async function processFileOperation(job) {
                             } else {
                                 const newLine = `${mountPoint}:${finalGroup}`;
                                 formatsList.push(newLine);
-                                await logMessage('INFO', 'activate', `Added new format ${newLine}`);
+                                await logMessage(LOG_TYPES.I, 'activate', `Added new format ${newLine}`);
                             }
                         }
                         stationsMap.set(stationCode, formatsList);
@@ -292,7 +292,7 @@ async function processFileOperation(job) {
                     for (const [station, formats] of [...stationsMap.entries()]) {
                         if (formats.length === 0) {
                             stationsMap.delete(station);
-                            await logMessage('INFO', 'deactivate', `Deleted station ${station} with no remaining formats`);
+                            await logMessage(LOG_TYPES.I, 'deactivate', `Deleted station ${station} with no remaining formats`);
                         }
                     }
 
@@ -398,19 +398,19 @@ async function processFileOperation(job) {
                     for (const station of stations) {
                         const clientmountField = station.ufCrm6_1747732721580;
                         if (!clientmountField || !clientmountField.startsWith('#')) {
-                            await logMessage('ERROR', 'webhook_handle_station_edit', `Invalid or missing clientmountField for station ${station.id}, skipping`);
+                            await logMessage(LOG_TYPES.E, 'webhook_handle_station_edit', `Invalid or missing clientmountField for station ${station.id}, skipping`);
                             continue;
                         }
 
                         const formats = station.formats;
                         if (formats.length === 0) {
-                            await logMessage('ERROR', 'webhook_handle_station_edit', `No formats provided for station ${station.id}, skipping`);
+                            await logMessage(LOG_TYPES.E, 'webhook_handle_station_edit', `No formats provided for station ${station.id}, skipping`);
                             continue;
                         }
 
                         if (!stationsMap.has(clientmountField)) {
                             stationsMap.set(clientmountField, []);
-                            await logMessage('INFO', 'webhook_handle_station_edit', `Added new station: ${clientmountField}`);
+                            await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Added new station: ${clientmountField}`);
                         }
 
                         const formatsList = stationsMap.get(clientmountField);
@@ -427,7 +427,7 @@ async function processFileOperation(job) {
                             } else {
                                 const newLine = `${mountPoint}:${group}`;
                                 formatsList.push(newLine);
-                                await logMessage('INFO', 'webhook_handle_station_edit', `Added new format ${newLine}`);
+                                await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Added new format ${newLine}`);
                             }
                         }
                         stationsMap.set(clientmountField, formatsList);
@@ -442,10 +442,10 @@ async function processFileOperation(job) {
                             }).filter(Boolean);
                             if (updatedFormats.length > 0) {
                                 stationsMap.set(station, updatedFormats);
-                                await logMessage('INFO', 'webhook_handle_station_edit', `Removed group ${group} from non-active station ${station}`);
+                                await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Removed group ${group} from non-active station ${station}`);
                             } else {
                                 stationsMap.delete(station);
-                                await logMessage('INFO', 'webhook_handle_station_edit', `Deleted non-active station ${station} with no remaining groups`);
+                                await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Deleted non-active station ${station} with no remaining groups`);
                             }
                         }
                     }
@@ -488,14 +488,14 @@ async function processFileOperation(job) {
 
             // Загружаем файл в /tmp на удаленном сервере
             await sftp.put(tempLocalPath, tempRemotePath);
-            await logMessage('INFO', 'worker', `Uploaded to ${tempRemotePath}, job ID: ${job.id}`);
+            await logMessage(LOG_TYPES.I, 'worker', `Uploaded to ${tempRemotePath}, job ID: ${job.id}`);
 
             // Проверяем целостность
             const stats = await sftp.stat(tempRemotePath);
             if (stats.size !== Buffer.from(modifiedContent).length) {
                 throw new Error(`Incomplete file upload: ${tempRemotePath} size ${stats.size}, expected ${Buffer.from(modifiedContent).length}`);
             }
-            await logMessage('INFO', 'worker', `Verified file size in /tmp: ${stats.size} bytes`);
+            await logMessage(LOG_TYPES.I, 'worker', `Verified file size in /tmp: ${stats.size} bytes`);
 
             // Подключаемся к SSH
             await new Promise((resolve, reject) => {
@@ -527,7 +527,7 @@ async function processFileOperation(job) {
                     }).stderr.on('data', (data) => stderr += data);
                 });
             });
-            await logMessage('INFO', 'worker', `Copied to ${remotePath}`);
+            await logMessage(LOG_TYPES.I, 'worker', `Copied to ${remotePath}`);
 
             // Проверяем содержимое записанного файла
             await sftp.connect(sftpConfig);
@@ -535,29 +535,29 @@ async function processFileOperation(job) {
             if (remoteStats.size !== Buffer.from(modifiedContent).length) {
                 throw new Error(`Incomplete file copy: ${remotePath} size ${remoteStats.size}, expected ${Buffer.from(modifiedContent).length}`);
             }
-            await logMessage('INFO', 'worker', `Verified copied file size: ${remoteStats.size} bytes`);
+            await logMessage(LOG_TYPES.I, 'worker', `Verified copied file size: ${remoteStats.size} bytes`);
 
             // Удаляем временный файл на удаленном сервере
             await sftp.delete(tempRemotePath);
-            await logMessage('INFO', 'worker', `Deleted ${tempRemotePath}`);
+            await logMessage(LOG_TYPES.I, 'worker', `Deleted ${tempRemotePath}`);
 
             return { success: true };
         } finally {
             try { await sftp.end(); } catch (e) {
-                await logMessage('ERROR', 'worker', `Failed to close SFTP: ${e.message}`);
+                await logMessage(LOG_TYPES.E, 'worker', `Failed to close SFTP: ${e.message}`);
             }
             try { ssh.end(); } catch (e) {
-                await logMessage('ERROR', 'worker', `Failed to close SSH: ${e.message}`);
+                await logMessage(LOG_TYPES.E, 'worker', `Failed to close SSH: ${e.message}`);
             }
         }
     } catch (error) {
-        await logMessage('ERROR', 'worker', `Failed to process job ${job.id} for ${remotePath}: ${error.message}`);
+        await logMessage(LOG_TYPES.E, 'worker', `Failed to process job ${job.id} for ${remotePath}: ${error.message}`);
         return { error: error.message };
     } finally {
         // Удаляем локальный временный файл
         if (tempLocalPath) {
             await fs.unlink(tempLocalPath).catch(e =>
-                logMessage('ERROR', 'worker', `Failed to delete local file ${tempLocalPath}: ${e.message}`)
+                logMessage(LOG_TYPES.E, 'worker', `Failed to delete local file ${tempLocalPath}: ${e.message}`)
             );
         }
     }
@@ -568,10 +568,10 @@ fileOperationsQueue.process(1, async (job) => await processFileOperation(job));
 
 // Логирование событий очереди
 fileOperationsQueue.on('failed', async (job, err) => {
-    await logMessage('ERROR', 'worker', `Job ${job.id} in fileOperationsQueue failed: ${err.message}`);
+    await logMessage(LOG_TYPES.E, 'worker', `Job ${job.id} in fileOperationsQueue failed: ${err.message}`);
 });
 fileOperationsQueue.on('completed', async (job) => {
-    await logMessage('INFO', 'worker', `Job ${job.id} in fileOperationsQueue completed`);
+    await logMessage(LOG_TYPES.I, 'worker', `Job ${job.id} in fileOperationsQueue completed`);
 });
 
 // Закрытие соединений с Redis при завершении
