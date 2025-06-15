@@ -1,6 +1,5 @@
-// worker.js
-import Client from 'ssh2-sftp-client';
 import { Client as SSHClient } from 'ssh2';
+import { Client as SCPClient } from 'node-scp';
 import Queue from 'bull';
 import { logMessage, formatDate, formatTime } from './logger.js';
 import path from 'path';
@@ -30,7 +29,7 @@ app.get('/health', async (req, res) => {
             queues: { fileOperations: queueStats }
         });
     } catch (error) {
-        await logMessage(LOG_TYPES.E, 'worker', `Health check failed: ${error.message}`);
+        await logMessage(globalThis.LOG_TYPES.E, 'worker', `Health check failed: ${error.message}`);
         res.status(500).json({ status: 'error', error: error.message });
     }
 });
@@ -43,7 +42,7 @@ const redisConfig = {
     password: process.env.REDIS_PASSWORD || ''
 };
 
-// Настраиваем единую очередь для операций с файлами
+// Настраиваем очередь для операций с файлами
 const fileOperationsQueue = new Queue('fileOperationsQueue', { redis: redisConfig });
 
 // saveTempFile - Сохраняет временный файл в воркере
@@ -55,164 +54,219 @@ async function saveTempFile(content, filename) {
     return tmpPath;
 }
 
-// downloadFile - Скачивает файл с удаленного сервера
-async function downloadFile(remotePath, sftpConfig) {
-    const sftp = new Client();
-    try {
-        await sftp.connect({
+// executeSSHCommand - Выполняет SSH-команду с новой сессией
+async function executeSSHCommand(command, sftpConfig, useSudo = false) {
+    const ssh = new SSHClient();
+    let stderr = '';
+    let stdout = '';
+    await logMessage(globalThis.LOG_TYPES.I, 'ssh', `Executing command: ${command}`);
+    return new Promise((resolve, reject) => {
+        ssh.on('ready', () => {
+            ssh.exec(command, { pty: useSudo }, (err, stream) => {
+                if (err) {
+                    ssh.end();
+                    return reject(err);
+                }
+                stream.on('data', (data) => {
+                    const dataStr = data.toString();
+                    if (useSudo && dataStr.includes('password')) {
+                        stream.write(`${sftpConfig.sudoPassword}\n`);
+                    } else {
+                        stdout += dataStr;
+                    }
+                }).on('close', (code) => {
+                    ssh.end();
+                    if (code === 0) resolve(stdout.trim());
+                    else reject(new Error(`Command "${command}" failed with code ${code}: ${stderr || 'No error message provided'}`));
+                }).stderr.on('data', (data) => {
+                    stderr += data.toString();
+                });
+            });
+        }).on('error', (err) => {
+            ssh.end();
+            reject(err);
+        }).connect({
             ...sftpConfig,
-            retries: 3,
-            readyTimeout: 10000,
             keepaliveInterval: 10000,
             keepaliveCountMax: 3
         });
-        const content = await sftp.get(remotePath);
-        return content.toString().split('\n').filter(line => line.trim()).join('\n');
+    });
+}
+
+// downloadFile - Скачивает файл с удаленного сервера через SCP
+async function downloadFile(remotePath, sftpConfig) {
+    const tempFileName = `tmp_${path.basename(remotePath)}`;
+    const tempRemotePath = `/tmp/${tempFileName}`;
+    const localTmpDir = path.join(process.cwd(), '/tmp');
+    const localPath = path.join(localTmpDir, tempFileName);
+
+    try {
+        // Создаем локальную папку /app/tmp
+        await logMessage(globalThis.LOG_TYPES.I, 'downloadFile', `Ensuring local directory ${localTmpDir} exists`);
+        await fs.mkdir(localTmpDir, { recursive: true });
+
+        // Создаем временную папку на сервере
+        await logMessage(globalThis.LOG_TYPES.I, 'downloadFile', `Ensuring remote directory /tmp exists`);
+        await executeSSHCommand(`mkdir -p /tmp`, sftpConfig);
+
+        // Копируем файл во временную папку на сервере с sudo
+        await logMessage(globalThis.LOG_TYPES.I, 'downloadFile', `Copying ${remotePath} to ${tempRemotePath}`);
+        await executeSSHCommand(`sudo cp ${remotePath} ${tempRemotePath} && sudo chmod 644 ${tempRemotePath}`, sftpConfig, true);
+        await logMessage(globalThis.LOG_TYPES.I, 'downloadFile', `Copied ${remotePath} to ${tempRemotePath}`);
+
+        // Скачиваем файл через SCP
+        await logMessage(globalThis.LOG_TYPES.I, 'downloadFile', `Downloading ${tempRemotePath} to ${localPath} via SCP`);
+        const scp = await SCPClient({
+            host: sftpConfig.host,
+            port: sftpConfig.port,
+            username: sftpConfig.username,
+            password: sftpConfig.password
+        });
+        await scp.downloadFile(tempRemotePath, localPath);
+        scp.close();
+
+        // Читаем локальный файл
+        const content = await fs.readFile(localPath, 'utf8');
+        await logMessage(globalThis.LOG_TYPES.I, 'downloadFile', `Downloaded ${remotePath}`);
+
+        // Удаляем временный файл на сервере с sudo
+        await executeSSHCommand(`sudo rm ${tempRemotePath}`, sftpConfig, true);
+        await logMessage(globalThis.LOG_TYPES.I, 'downloadFile', `Deleted ${tempRemotePath}`);
+
+        // Удаляем локальный временный файл
+        await fs.unlink(localPath);
+
+        return content.split('\n').filter(line => line.trim()).join('\n');
     } catch (error) {
-        await logMessage(LOG_TYPES.E, 'downloadFile', `Failed to download ${remotePath}: ${error.message}`);
+        await logMessage(globalThis.LOG_TYPES.E, 'downloadFile', `Failed to download ${remotePath}: ${error.message}`);
         throw error;
-    } finally {
-        await sftp.end();
     }
 }
 
 // backupAndRotate - Создает бэкап файла и управляет ротацией папок
-async function backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename, taskDate) {
-    await logMessage(LOG_TYPES.I, 'backup', `Starting backup for ${remotePath}`);
+async function backupAndRotate(sftpConfig, remotePath, filename, taskDate) {
+    await logMessage(globalThis.LOG_TYPES.I, 'backup', `Starting backup for ${remotePath}`);
     try {
         const dateFolder = `folder_${formatDate(taskDate)}`;
         const timeFolder = `folder_${formatDate(taskDate)}_${formatTime(taskDate)}`;
-        const dateDir = `/home/casteradmin/${dateFolder}`;
+        const dateDir = `/home/bitrix/${dateFolder}`;
         const backupDir = `${dateDir}/${timeFolder}`;
         const backupPath = `${backupDir}/${filename}`;
-        const backupRoot = '/home/casteradmin';
+        const backupRoot = '/home/bitrix';
+        const tempFileName = `backup_${filename}_${Date.now()}`;
+        const tempRemotePath = `/tmp/${tempFileName}`;
+        const localPath = path.join(process.cwd(), '/tmp', tempFileName);
 
-        // Проверяем доступность /home/casteradmin
-        await logMessage(LOG_TYPES.I, 'backup', `Checking access to ${backupRoot}`);
-        try {
-            await sftp.stat(backupRoot);
-        } catch (error) {
-            await logMessage(LOG_TYPES.E, 'backup', `Cannot access ${backupRoot}: ${error.message}`);
-            return;
-        }
+        // Проверяем существование /home/bitrix
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Checking if ${backupRoot} exists`);
+        await executeSSHCommand(`ls ${backupRoot}`, sftpConfig);
+
+        // Создаем временную папку на сервере
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Ensuring remote directory /tmp exists`);
+        await executeSSHCommand(`mkdir -p /tmp`, sftpConfig);
 
         // Создаем дневную папку
-        await logMessage(LOG_TYPES.I, 'backup', `Creating date directory ${dateDir}`);
-        try {
-            await sftp.mkdir(dateDir, true);
-            await logMessage(LOG_TYPES.I, 'backup', `Created date directory ${dateDir}`);
-        } catch (error) {
-            if (error.code !== 4) { // Код 4 - папка уже существует
-                await logMessage(LOG_TYPES.E, 'backup', `Failed to create date directory ${dateDir}: ${error.message}`);
-                return;
-            }
-            await logMessage(LOG_TYPES.I, 'backup', `Date directory ${dateDir} already exists`);
-        }
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Creating date directory ${dateDir}`);
+        await executeSSHCommand(`mkdir -p ${dateDir}`, sftpConfig);
 
         // Создаем временную папку
-        await logMessage(LOG_TYPES.I, 'backup', `Creating backup directory ${backupDir}`);
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Creating backup directory ${backupDir}`);
+        await executeSSHCommand(`mkdir -p ${backupDir}`, sftpConfig);
+
+        // Копируем файл во временную папку на сервере с sudo
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Copying ${remotePath} to ${tempRemotePath}`);
+        await executeSSHCommand(`sudo cp ${remotePath} ${tempRemotePath} && sudo chmod 644 ${tempRemotePath}`, sftpConfig, true);
+
+        // Скачиваем файл через SCP
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Downloading ${tempRemotePath} to ${localPath} via SCP`);
+        const scp = await SCPClient({
+            host: sftpConfig.host,
+            port: sftpConfig.port,
+            username: sftpConfig.username,
+            password: sftpConfig.password
+        });
+        await scp.downloadFile(tempRemotePath, localPath);
+        scp.close();
+
+        // Загружаем файл в бэкап-папку через SCP
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Uploading ${localPath} to ${backupPath} via SCP`);
+        const scpUpload = await SCPClient({
+            host: sftpConfig.host,
+            port: sftpConfig.port,
+            username: sftpConfig.username,
+            password: sftpConfig.password
+        });
+        await scpUpload.uploadFile(localPath, backupPath);
+        scpUpload.close();
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Backed up ${remotePath} to ${backupPath}`);
+
+        // Удаляем временные файлы с sudo
+        await executeSSHCommand(`sudo rm ${tempRemotePath}`, sftpConfig, true);
+        await fs.unlink(localPath);
+
+        // Ротация временных папок
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Starting time folder rotation check in ${dateDir}`);
+        let timeFoldersOutput;
         try {
-            await sftp.mkdir(backupDir, true);
-            await logMessage(LOG_TYPES.I, 'backup', `Created backup directory ${backupDir}`);
+            timeFoldersOutput = await executeSSHCommand(`ls -d ${dateDir}/folder_*_*_*_*`, sftpConfig);
         } catch (error) {
-            await logMessage(LOG_TYPES.E, 'backup', `Failed to create backup directory ${backupDir}: ${error.message}`);
-            return;
+            if (error.message.includes('No such file or directory')) {
+                timeFoldersOutput = '';
+            } else {
+                throw error;
+            }
         }
+        const timeFolders = timeFoldersOutput
+            .split('\n')
+            .filter(name => name.match(/folder_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}$/))
+            .map(name => path.basename(name))
+            .sort();
 
-        // Копируем текущий файл в папку бэкапа
-        await logMessage(LOG_TYPES.I, 'backup', `Copying ${remotePath} to ${backupPath}`);
-        try {
-            await new Promise((resolve, reject) => {
-                let stderr = '';
-                ssh.exec(`sudo cp ${remotePath} ${backupPath}`, { pty: true }, (err, stream) => {
-                    if (err) {
-                        reject(err);
-                        return;
-                    }
-                    stream.on('close', (code) => {
-                        if (code === 0) resolve();
-                        else reject(new Error(`sudo cp to backup failed with code ${code}: ${stderr}`));
-                    }).on('data', (data) => {
-                        const dataStr = data.toString();
-                        if (dataStr.includes('password')) {
-                            stream.write(`${sftpConfig.sudoPassword}\n`);
-                        }
-                    }).stderr.on('data', (data) => {
-                        stderr += data;
-                    });
-                });
-            });
-            await logMessage(LOG_TYPES.I, 'backup', `Backed up ${remotePath} to ${backupPath}`);
-        } catch (error) {
-            await logMessage(LOG_TYPES.E, 'backup', `Failed to copy ${remotePath} to ${backupPath}: ${error.message}`);
-            return;
-        }
-
-        // Ротация временных папок в дневной папке
-        await logMessage(LOG_TYPES.I, 'backup', `Starting time folder rotation check in ${dateDir}`);
-        let timeDirList;
-        try {
-            timeDirList = await sftp.list(dateDir);
-            await logMessage(LOG_TYPES.I, 'backup', `Listed time directories in ${dateDir}`);
-        } catch (error) {
-            await logMessage(LOG_TYPES.E, 'backup', `Failed to list time directories in ${dateDir}: ${error.message}`);
-            return;
-        }
-
-        const timeFolders = timeDirList
-            .filter(item => item.type === 'd' && item.name.match(/^folder_\d{4}-\d{2}-\d{2}_\d{2}_\d{2}_\d{2}$/))
-            .sort((a, b) => a.name.localeCompare(b.name)); // Сортировка по имени (дата и время)
-
-        await logMessage(LOG_TYPES.I, 'backup', `Found ${timeFolders.length} time folders in ${dateDir}: ${timeFolders.map(f => f.name).join(', ')}`);
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Found ${timeFolders.length} time folders in ${dateDir}: ${timeFolders.join(', ')}`);
 
         if (timeFolders.length >= 30) {
-            const oldestTimeFolder = timeFolders[0].name;
+            const oldestTimeFolder = timeFolders[0];
             const oldestTimePath = `${dateDir}/${oldestTimeFolder}`;
-            await logMessage(LOG_TYPES.I, 'backup', `Deleting oldest time folder ${oldestTimePath}`);
-            try {
-                await sftp.rmdir(oldestTimePath, true);
-                await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest time folder ${oldestTimePath}`);
-            } catch (error) {
-                await logMessage(LOG_TYPES.E, 'backup', `Failed to delete ${oldestTimePath}: ${error.message}`);
-            }
+            await logMessage(globalThis.LOG_TYPES.I, 'backup', `Deleting oldest time folder ${oldestTimePath}`);
+            await executeSSHCommand(`rm -rf ${oldestTimePath}`, sftpConfig);
+            await logMessage(globalThis.LOG_TYPES.I, 'backup', `Deleted oldest time folder ${oldestTimePath}`);
         } else {
-            await logMessage(LOG_TYPES.I, 'backup', `No time folder rotation needed, ${timeFolders.length} folders found in ${dateDir}`);
+            await logMessage(globalThis.LOG_TYPES.I, 'backup', `No time folder rotation needed, ${timeFolders.length} folders found in ${dateDir}`);
         }
 
         // Ротация дневных папок
-        await logMessage(LOG_TYPES.I, 'backup', `Starting date folder rotation check in ${backupRoot}`);
-        let dateDirList;
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Starting date folder rotation check in ${backupRoot}`);
+        let dateFoldersOutput;
         try {
-            dateDirList = await sftp.list(backupRoot);
-            await logMessage(LOG_TYPES.I, 'backup', `Listed date directories in ${backupRoot}`);
+            dateFoldersOutput = await executeSSHCommand(`ls -d ${backupRoot}/folder_*`, sftpConfig);
         } catch (error) {
-            await logMessage(LOG_TYPES.E, 'backup', `Failed to list date directories in ${backupRoot}: ${error.message}`);
-            return;
+            if (error.message.includes('No such file or directory')) {
+                dateFoldersOutput = '';
+            } else {
+                throw error;
+            }
         }
+        const dateFolders = dateFoldersOutput
+            .split('\n')
+            .filter(name => name.match(/folder_\d{4}-\d{2}-\d{2}$/))
+            .map(name => path.basename(name))
+            .sort();
 
-        const dateFolders = dateDirList
-            .filter(item => item.type === 'd' && item.name.match(/^folder_\d{4}-\d{2}-\d{2}$/))
-            .sort((a, b) => a.name.localeCompare(b.name)); // Сортировка по имени (дата)
-
-        await logMessage(LOG_TYPES.I, 'backup', `Found ${dateFolders.length} date folders: ${dateFolders.map(f => f.name).join(', ')}`);
+        await logMessage(globalThis.LOG_TYPES.I, 'backup', `Found ${dateFolders.length} date folders: ${dateFolders.join(', ')}`);
 
         if (dateFolders.length >= 10) {
-            const oldestDateFolder = dateFolders[0].name;
+            const oldestDateFolder = dateFolders[0];
             const oldestDatePath = `${backupRoot}/${oldestDateFolder}`;
-            await logMessage(LOG_TYPES.I, 'backup', `Deleting oldest date folder ${oldestDatePath}`);
-            try {
-                await sftp.rmdir(oldestDatePath, true);
-                await logMessage(LOG_TYPES.I, 'backup', `Deleted oldest date folder ${oldestDatePath}`);
-            } catch (error) {
-                await logMessage(LOG_TYPES.E, 'backup', `Failed to delete ${oldestDatePath}: ${error.message}`);
-            }
+            await logMessage(globalThis.LOG_TYPES.I, 'backup', `Deleting oldest date folder ${oldestDatePath}`);
+            await executeSSHCommand(`rm -rf ${oldestDatePath}`, sftpConfig);
+            await logMessage(globalThis.LOG_TYPES.I, 'backup', `Deleted oldest date folder ${oldestDatePath}`);
         } else {
-            await logMessage(LOG_TYPES.I, 'backup', `No date folder rotation needed, ${dateFolders.length} folders found`);
+            await logMessage(globalThis.LOG_TYPES.I, 'backup', `No date folder rotation needed, ${dateFolders.length} folders found`);
         }
     } catch (error) {
-        await logMessage(LOG_TYPES.E, 'backup', `Unexpected error in backup for ${remotePath}: ${error.message}`);
+        await logMessage(globalThis.LOG_TYPES.E, 'backup', `Unexpected error in backup for ${remotePath}: ${error.message}`);
     }
-    await logMessage(LOG_TYPES.I, 'backup', `Finished backup for ${remotePath}`);
+    await logMessage(globalThis.LOG_TYPES.I, 'backup', `Finished backup for ${remotePath}`);
 }
 
 // processFileOperation - Обрабатывает задачу с файлом (скачивание, модификация, запись)
@@ -220,8 +274,8 @@ async function processFileOperation(job) {
     const { operation, params, remotePath, sftpConfig } = job.data;
     const filename = path.basename(remotePath);
     let tempLocalPath;
-    // Используем taskTimestamp из params, если доступно, иначе текущее время
     const taskDate = params.taskTimestamp ? new Date(params.taskTimestamp) : new Date();
+    const tempRemotePath = `/tmp/${filename}`;
 
     try {
         // Скачиваем текущий файл
@@ -233,7 +287,6 @@ async function processFileOperation(job) {
             case 'activate': {
                 const { finalLogin, finalPassword, finalGroup, stations } = params;
 
-                // Модификация users.aut
                 if (remotePath.includes('users.aut')) {
                     let usersLines = content.split('\n');
                     const headerUsersLines = [];
@@ -251,10 +304,7 @@ async function processFileOperation(job) {
                     }
                     usersLines = [...headerUsersLines, ...usersLines.slice(headerUsersLines.length).filter(line => !line.startsWith(`${finalLogin}:`)), `${finalLogin}:${finalPassword}`];
                     modifiedContent = usersLines.join('\n') + '\n';
-                }
-
-                // Модификация groups.aut
-                else if (remotePath.includes('groups.aut')) {
+                } else if (remotePath.includes('groups.aut')) {
                     let groupsLines = content.split('\n');
                     const headerGroupsLines = [];
                     let foundGroupsStart = false;
@@ -268,10 +318,7 @@ async function processFileOperation(job) {
                     if (!foundGroupsStart) throw new Error('gAdmins group not found in groups.aut');
                     groupsLines = [...headerGroupsLines, ...groupsLines.slice(headerGroupsLines.length).filter(line => !line.startsWith(`${finalGroup}:`)), `${finalGroup}:${finalLogin}:1`];
                     modifiedContent = groupsLines.join('\n') + '\n';
-                }
-
-                // Модификация clientmounts.aut
-                else if (remotePath.includes('clientmounts.aut')) {
+                } else if (remotePath.includes('clientmounts.aut')) {
                     const mountsLines = content.split('\n');
                     const headerMountsLines = [];
                     const stationsMap = new Map();
@@ -294,18 +341,18 @@ async function processFileOperation(job) {
 
                     for (const station of stations) {
                         if (!station.name || !station.formats || !Array.isArray(station.formats)) {
-                            await logMessage(LOG_TYPES.E, 'activate', `Invalid station data: ${JSON.stringify(station)}`);
+                            await logMessage(globalThis.LOG_TYPES.E, 'activate', `Invalid station data: ${JSON.stringify(station)}`);
                             continue;
                         }
                         const stationCode = `#${station.name.trim()}`;
                         if (!stationsMap.has(stationCode)) {
                             stationsMap.set(stationCode, []);
-                            await logMessage(LOG_TYPES.I, 'activate', `Added new station: ${stationCode}`);
+                            await logMessage(globalThis.LOG_TYPES.I, 'activate', `Added new station: ${stationCode}`);
                         }
                         const formatsList = stationsMap.get(stationCode);
                         for (let format of station.formats) {
                             if (!format || typeof format !== 'string') {
-                                await logMessage(LOG_TYPES.E, 'activate', `Invalid format in station ${stationCode}: ${format}`);
+                                await logMessage(globalThis.LOG_TYPES.E, 'activate', `Invalid format in station ${stationCode}: ${format}`);
                                 continue;
                             }
                             const mountPoint = (format.startsWith('/') ? format : '/' + format).replace(/:?$/, '');
@@ -321,7 +368,7 @@ async function processFileOperation(job) {
                             } else {
                                 const newLine = `${mountPoint}:${finalGroup}`;
                                 formatsList.push(newLine);
-                                await logMessage(LOG_TYPES.I, 'activate', `Added new format ${newLine}`);
+                                await logMessage(globalThis.LOG_TYPES.I, 'activate', `Added new format ${newLine}`);
                             }
                         }
                         stationsMap.set(stationCode, formatsList);
@@ -342,11 +389,9 @@ async function processFileOperation(job) {
                 }
                 break;
             }
-
             case 'deactivate': {
                 const { login, group } = params;
 
-                // Модификация users.aut
                 if (remotePath.includes('users.aut')) {
                     let usersLines = content.split('\n');
                     const headerUsersLines = [];
@@ -361,10 +406,7 @@ async function processFileOperation(job) {
                     if (!foundUsersStart) throw new Error('Admin user not found in users.aut');
                     usersLines = [...headerUsersLines, ...usersLines.slice(headerUsersLines.length).filter(line => !line.startsWith(`${login}:`))];
                     modifiedContent = usersLines.join('\n') + '\n';
-                }
-
-                // Модификация groups.aut
-                else if (remotePath.includes('groups.aut')) {
+                } else if (remotePath.includes('groups.aut')) {
                     let groupsLines = content.split('\n');
                     const headerGroupsLines = [];
                     let foundGroupsStart = false;
@@ -378,10 +420,7 @@ async function processFileOperation(job) {
                     if (!foundGroupsStart) throw new Error('gAdmins group not found in groups.aut');
                     groupsLines = [...headerGroupsLines, ...groupsLines.slice(headerGroupsLines.length).filter(line => !line.startsWith(`${group}:`))];
                     modifiedContent = groupsLines.join('\n') + '\n';
-                }
-
-                // Модификация clientmounts.aut
-                else if (remotePath.includes('clientmounts.aut')) {
+                } else if (remotePath.includes('clientmounts.aut')) {
                     const mountsLines = content.split('\n');
                     const headerMountsLines = [];
                     const stationsMap = new Map();
@@ -414,7 +453,7 @@ async function processFileOperation(job) {
                     for (const [station, formats] of [...stationsMap.entries()]) {
                         if (formats.length === 0) {
                             stationsMap.delete(station);
-                            await logMessage(LOG_TYPES.I, 'deactivate', `Deleted station ${station} with no remaining formats`);
+                            await logMessage(globalThis.LOG_TYPES.I, 'deactivate', `Deleted station ${station} with no remaining formats`);
                         }
                     }
 
@@ -431,11 +470,9 @@ async function processFileOperation(job) {
                 }
                 break;
             }
-
             case 'handle_new_station_creation': {
                 const { clientmountField, formats, groups } = params;
 
-                // Модификация clientmounts.aut
                 if (remotePath.includes('clientmounts.aut')) {
                     const mountsLines = content.split('\n');
                     const headerMountsLines = [];
@@ -491,11 +528,9 @@ async function processFileOperation(job) {
                 }
                 break;
             }
-
             case 'webhook_handle_station_edit': {
                 const { stations, group, activeStationCodes } = params;
 
-                // Модификация clientmounts.aut
                 if (remotePath.includes('clientmounts.aut')) {
                     const mountsLines = content.split('\n');
                     const headerMountsLines = [];
@@ -520,19 +555,19 @@ async function processFileOperation(job) {
                     for (const station of stations) {
                         const clientmountField = station.ufCrm6_1747732721580;
                         if (!clientmountField || !clientmountField.startsWith('#')) {
-                            await logMessage(LOG_TYPES.E, 'webhook_handle_station_edit', `Invalid or missing clientmountField for station ${station.id}, skipping`);
+                            await logMessage(globalThis.LOG_TYPES.E, 'webhook_handle_station_edit', `Invalid or missing clientmountField for station ${station.id}, skipping`);
                             continue;
                         }
 
                         const formats = station.formats;
                         if (formats.length === 0) {
-                            await logMessage(LOG_TYPES.E, 'webhook_handle_station_edit', `No formats provided for station ${station.id}, skipping`);
+                            await logMessage(globalThis.LOG_TYPES.E, 'webhook_handle_station_edit', `No formats provided for station ${station.id}, skipping`);
                             continue;
                         }
 
                         if (!stationsMap.has(clientmountField)) {
                             stationsMap.set(clientmountField, []);
-                            await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Added new station: ${clientmountField}`);
+                            await logMessage(globalThis.LOG_TYPES.I, 'webhook_handle_station_edit', `Added new station: ${clientmountField}`);
                         }
 
                         const formatsList = stationsMap.get(clientmountField);
@@ -549,7 +584,7 @@ async function processFileOperation(job) {
                             } else {
                                 const newLine = `${mountPoint}:${group}`;
                                 formatsList.push(newLine);
-                                await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Added new format ${newLine}`);
+                                await logMessage(globalThis.LOG_TYPES.I, 'webhook_handle_station_edit', `Added new format ${newLine}`);
                             }
                         }
                         stationsMap.set(clientmountField, formatsList);
@@ -564,10 +599,10 @@ async function processFileOperation(job) {
                             }).filter(Boolean);
                             if (updatedFormats.length > 0) {
                                 stationsMap.set(station, updatedFormats);
-                                await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Removed group ${group} from non-active station ${station}`);
+                                await logMessage(globalThis.LOG_TYPES.I, 'webhook_handle_station_edit', `Removed group ${group} from non-active station ${station}`);
                             } else {
                                 stationsMap.delete(station);
-                                await logMessage(LOG_TYPES.I, 'webhook_handle_station_edit', `Deleted non-active station ${station} with no remaining groups`);
+                                await logMessage(globalThis.LOG_TYPES.I, 'webhook_handle_station_edit', `Deleted non-active station ${station} with no remaining groups`);
                             }
                         }
                     }
@@ -587,118 +622,86 @@ async function processFileOperation(job) {
                 }
                 break;
             }
-
             default:
                 throw new Error(`Unsupported operation: ${operation}`);
         }
 
         // Создаем временный файл
         tempLocalPath = await saveTempFile(modifiedContent, filename);
-        const tempRemotePath = `/home/casteradmin/${filename}`;
-        const sftp = new Client();
-        const ssh = new SSHClient();
 
-        try {
-            // Подключаемся к SFTP
-            await sftp.connect({
-                ...sftpConfig,
-                retries: 3,
-                readyTimeout: 10000,
-                keepaliveInterval: 10000,
-                keepaliveCountMax: 3
-            });
+        // Создаем временную папку на сервере
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Ensuring remote directory /tmp exists for job ${job.id}`);
+        await executeSSHCommand(`mkdir -p /tmp`, sftpConfig);
 
-            // Загружаем файл в /tmp на удаленном сервере
-            await logMessage(LOG_TYPES.I, 'worker', `Uploading to ${tempRemotePath}, job ID: ${job.id}`);
-            await sftp.put(tempLocalPath, tempRemotePath);
-            await logMessage(LOG_TYPES.I, 'worker', `Uploaded to ${tempRemotePath}, job ID: ${job.id}`);
+        // Проверяем права на удаленную папку
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Checking permissions for /tmp`);
+        await executeSSHCommand(`ls -ld /tmp`, sftpConfig);
 
-            // Проверяем целостность
-            const stats = await sftp.stat(tempRemotePath);
-            if (stats.size !== Buffer.from(modifiedContent).length) {
-                throw new Error(`Incomplete file upload: ${tempRemotePath} size ${stats.size}, expected ${Buffer.from(modifiedContent).length}`);
-            }
-            await logMessage(LOG_TYPES.I, 'worker', `Verified file size in /tmp: ${stats.size} bytes`);
+        // Загружаем файл через SCP
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Uploading ${tempLocalPath} to ${tempRemotePath} via SCP, job ID: ${job.id}`);
+        const scp = await SCPClient({
+            host: sftpConfig.host,
+            port: sftpConfig.port,
+            username: sftpConfig.username,
+            password: sftpConfig.password
+        });
+        await scp.uploadFile(tempLocalPath, tempRemotePath);
+        scp.close();
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Uploaded to ${tempRemotePath}, job ID: ${job.id}`);
 
-            // Подключаемся к SSH
-            await new Promise((resolve, reject) => {
-                ssh.on('ready', resolve)
-                    .on('error', reject)
-                    .connect({
-                        ...sftpConfig,
-                        keepaliveInterval: 10000,
-                        keepaliveCountMax: 3
-                    });
-            });
-
-            // Создаем бэкап и управляем ротацией
-            await backupAndRotate(sftp, ssh, sftpConfig, remotePath, filename, taskDate);
-
-            // Выполняем sudo cp
-            await logMessage(LOG_TYPES.I, 'worker', `Copying to ${remotePath}`);
-            const command = `sudo cp ${tempRemotePath} ${remotePath}`;
-            let stderr = '';
-            await new Promise((resolve, reject) => {
-                ssh.exec(command, { pty: true }, (err, stream) => {
-                    if (err) reject(err);
-                    stream.on('close', (code) => {
-                        if (code === 0) resolve();
-                        else reject(new Error(`sudo cp failed: ${stderr}`));
-                    }).on('data', (data) => {
-                        if (data.toString().includes('password')) {
-                            stream.write(`${sftpConfig.sudoPassword}\n`);
-                        }
-                    }).stderr.on('data', (data) => stderr += data);
-                });
-            });
-            await logMessage(LOG_TYPES.I, 'worker', `Copied to ${remotePath}`);
-
-            // Проверяем содержимое записанного файла
-            await logMessage(LOG_TYPES.I, 'worker', `Verifying copied file size at ${remotePath}`);
-            const remoteStats = await sftp.stat(remotePath);
-            if (remoteStats.size !== Buffer.from(modifiedContent).length) {
-                throw new Error(`Incomplete file copy: ${remotePath} size ${remoteStats.size}, expected ${Buffer.from(modifiedContent).length}`);
-            }
-            await logMessage(LOG_TYPES.I, 'worker', `Verified copied file size: ${remoteStats.size} bytes`);
-
-            // Удаляем временный файл на удаленном сервере
-            await sftp.delete(tempRemotePath);
-            await logMessage(LOG_TYPES.I, 'worker', `Deleted ${tempRemotePath}`);
-
-            return { success: true };
-        } finally {
-            try { await sftp.end(); } catch (e) {
-                await logMessage(LOG_TYPES.E, 'worker', `Failed to close SFTP: ${e.message}`);
-            }
-            try { ssh.end(); } catch (e) {
-                await logMessage(LOG_TYPES.E, 'worker', `Failed to close SSH: ${e.message}`);
-            }
+        // Проверяем целостность
+        const remoteSize = parseInt(await executeSSHCommand(`ls -l ${tempRemotePath} | awk '{print $5}'`, sftpConfig));
+        const expectedSize = Buffer.from(modifiedContent).length;
+        if (remoteSize !== expectedSize) {
+            throw new Error(`Incomplete file upload: ${tempRemotePath} size ${remoteSize}, expected ${expectedSize}`);
         }
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Verified file size in /tmp: ${remoteSize} bytes`);
+
+        // Создаем бэкап и управляем ротацией
+        await backupAndRotate(sftpConfig, remotePath, filename, taskDate);
+
+        // Выполняем копирование с sudo
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Copying to ${remotePath}`);
+        await executeSSHCommand(`sudo cp ${tempRemotePath} ${remotePath}`, sftpConfig, true);
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Copied to ${remotePath}`);
+
+        // Проверяем содержимое записанного файла
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Verifying copied file size at ${remotePath}`);
+        const finalSize = parseInt(await executeSSHCommand(`ls -l ${remotePath} | awk '{print $5}'`, sftpConfig));
+        if (finalSize !== expectedSize) {
+            throw new Error(`Incomplete file copy: ${remotePath} size ${finalSize}, expected ${expectedSize}`);
+        }
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Verified copied file size: ${finalSize} bytes`);
+
+        // Удаляем временный файл на сервере с sudo
+        await executeSSHCommand(`sudo rm ${tempRemotePath}`, sftpConfig, true);
+        await logMessage(globalThis.LOG_TYPES.I, 'worker', `Deleted ${tempRemotePath}`);
+
+        return { success: true };
     } catch (error) {
-        await logMessage(LOG_TYPES.E, 'worker', `Failed to process job ${job.id} for ${remotePath}: ${error.message}`);
+        await logMessage(globalThis.LOG_TYPES.E, 'worker', `Failed to process job ${job.id} for ${remotePath}: ${error.message}`);
         throw error;
     } finally {
-        // Удаляем локальный временный файл
         if (tempLocalPath) {
             await fs.unlink(tempLocalPath).catch(e =>
-                logMessage(LOG_TYPES.E, 'worker', `Failed to delete local file ${tempLocalPath}: ${e.message}`)
+                logMessage(globalThis.LOG_TYPES.E, 'worker', `Failed to delete local file ${tempLocalPath}: ${e.message}`)
             );
         }
     }
 }
 
-// Регистрируем обработчик для очереди с concurrency: 1
+// Регистрируем обработчик для очереди
 fileOperationsQueue.process(1, async (job) => await processFileOperation(job));
 
 // Логирование событий очереди
 fileOperationsQueue.on('failed', async (job, err) => {
-    await logMessage(LOG_TYPES.E, 'worker', `Job ${job.id} in fileOperationsQueue failed: ${err.message}`);
+    await logMessage(globalThis.LOG_TYPES.E, 'worker', `Job ${job.id} in fileOperationsQueue failed: ${err.message}`);
 });
 fileOperationsQueue.on('completed', async (job) => {
-    await logMessage(LOG_TYPES.I, 'worker', `Job ${job.id} in fileOperationsQueue completed`);
+    await logMessage(globalThis.LOG_TYPES.I, 'worker', `Job ${job.id} in fileOperationsQueue completed`);
 });
 
-// Закрытие соединений с Redis при завершении
+// Закрытие соединений с Redis
 process.on('SIGTERM', async () => {
     await fileOperationsQueue.close();
     process.exit(0);
